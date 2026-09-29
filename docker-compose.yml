@@ -1,0 +1,21 @@
+# Local development environment.
+#   docker compose up --build          -> http://localhost:8080
+#   docker compose run --rm api composer ci   -> run the same checks CI runs
+services:
+  api:
+    build:
+      context: .
+      dockerfile: backend-php/Dockerfile
+      target: dev
+    ports:
+      - "8080:8080"
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      APP_ENV: local
+      APP_VERSION: local-dev
+    volumes:
+      # Live-edit code on your machine; changes show up without rebuilding.
+      - ./backend-php:/var/www/app
+      - ./frontend:/var/www/frontend

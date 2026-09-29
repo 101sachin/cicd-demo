@@ -1,0 +1,21 @@
+# Secrets - never commit
+.env
+.env.*
+!.env.example
+
+# Dependencies (re-installed by composer / pip)
+backend-php/vendor/
+backend-python/.venv/
+__pycache__/
+
+# Tool caches & reports
+.phpunit.cache/
+*.cache
+coverage/
+junit.xml
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

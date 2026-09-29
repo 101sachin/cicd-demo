@@ -1,0 +1,12 @@
+# Keep the Docker build context small and secret-free.
+.git
+.github
+.env
+.env.*
+docs
+database
+backend-python
+**/vendor
+**/.phpunit.cache
+backend-php/tests
+*.md

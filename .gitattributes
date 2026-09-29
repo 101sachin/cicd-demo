@@ -1,0 +1,2 @@
+# Windows checkouts must not turn LF into CRLF for files that run inside Linux containers.
+* text=auto eol=lf

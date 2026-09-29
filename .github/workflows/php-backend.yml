@@ -1,0 +1,252 @@
+# ============================================================================
+#  PHP Backend CI/CD pipeline
+#  Explained line by line in docs/04-pipeline-walkthrough.md
+#
+#   push / PR ─▶ [quality] ─┐
+#                [test x2] ─┴─▶ [docker: build ▶ smoke test ▶ push] ─▶ [deploy ▶ verify]
+#                                                (main only)             (main only)
+# ============================================================================
+name: PHP Backend CI/CD
+
+# ---- 1. TRIGGERS: when does the pipeline run? -------------------------------
+on:
+  push:
+    branches: [main]
+    paths:                      # only when PHP-related files change (monorepo!)
+      - 'backend-php/**'
+      - 'frontend/**'
+      - '.github/workflows/php-backend.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'backend-php/**'
+      - 'frontend/**'
+      - '.github/workflows/php-backend.yml'
+  workflow_dispatch:            # adds a "Run workflow" button in the Actions tab
+
+# ---- 2. CONCURRENCY: a newer push cancels the older, still-running pipeline --
+concurrency:
+  group: php-backend-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# ---- 3. LEAST PRIVILEGE: the default token can only read the repo -----------
+permissions:
+  contents: read
+
+jobs:
+  # ==========================================================================
+  # CI STAGE 1: code quality (fast feedback - fails in ~30s on style errors)
+  # ==========================================================================
+  quality:
+    name: Lint & static analysis
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend-php
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v5
+
+      - name: Set up PHP 8.3
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          tools: composer:v2
+          coverage: none
+
+      - name: Get Composer cache directory
+        id: composer-cache
+        run: echo "dir=$(composer config cache-files-dir)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Composer packages
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.composer-cache.outputs.dir }}
+          key: composer-${{ runner.os }}-${{ hashFiles('backend-php/composer.lock') }}
+          restore-keys: composer-${{ runner.os }}-
+
+      - name: Validate composer.json / composer.lock
+        run: composer validate --strict
+
+      - name: Install dependencies
+        run: composer install --no-interaction --no-progress --prefer-dist
+
+      - name: PHP syntax check
+        run: find src public tests -name '*.php' -print0 | xargs -0 -n1 php -l
+
+      - name: Coding standard (PSR-12)
+        run: composer lint
+
+      - name: Static analysis (PHPStan)
+        run: composer analyse
+
+  # ==========================================================================
+  # CI STAGE 2: unit tests on every supported PHP version (matrix = parallel)
+  # ==========================================================================
+  test:
+    name: Unit tests (PHP ${{ matrix.php }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false          # let both versions finish so you see all failures
+      matrix:
+        php: ['8.2', '8.3']
+    defaults:
+      run:
+        working-directory: backend-php
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          tools: composer:v2
+          coverage: pcov
+
+      - name: Get Composer cache directory
+        id: composer-cache
+        run: echo "dir=$(composer config cache-files-dir)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/cache@v4
+        with:
+          path: ${{ steps.composer-cache.outputs.dir }}
+          key: composer-${{ runner.os }}-${{ hashFiles('backend-php/composer.lock') }}
+          restore-keys: composer-${{ runner.os }}-
+
+      - name: Install dependencies
+        run: composer install --no-interaction --no-progress --prefer-dist
+
+      - name: Run PHPUnit with coverage
+        run: vendor/bin/phpunit --coverage-text --log-junit junit.xml
+
+      - name: Upload test report
+        if: always()            # upload even when tests fail - that's when you need it
+        uses: actions/upload-artifact@v4
+        with:
+          name: phpunit-report-php-${{ matrix.php }}
+          path: backend-php/junit.xml
+          retention-days: 7
+
+  # ==========================================================================
+  # CI STAGE 3: build the Docker image ONCE, test it, publish it
+  # ==========================================================================
+  docker:
+    name: Build, smoke-test & publish image
+    runs-on: ubuntu-latest
+    needs: [quality, test]      # only runs if ALL earlier jobs passed
+    permissions:
+      contents: read
+      packages: write           # needed to push to GitHub Container Registry
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Compute image name and tag
+        id: meta
+        env:
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          repo="ghcr.io/${OWNER,,}/student-api-php"     # registry names must be lowercase
+          echo "repo=$repo"                     >> "$GITHUB_OUTPUT"
+          echo "image=$repo:sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Build production image
+        run: |
+          docker build \
+            --file backend-php/Dockerfile \
+            --target prod \
+            --build-arg APP_VERSION=${{ github.sha }} \
+            --label org.opencontainers.image.source=https://github.com/${{ github.repository }} \
+            --label org.opencontainers.image.revision=${{ github.sha }} \
+            --tag ${{ steps.meta.outputs.image }} \
+            --tag ${{ steps.meta.outputs.repo }}:latest \
+            .
+
+      - name: Smoke test the image
+        run: |
+          docker run -d --name smoke -p 8080:8080 ${{ steps.meta.outputs.image }}
+
+          for _ in $(seq 1 15); do
+            curl -fsS http://localhost:8080/api/health && break
+            sleep 2
+          done
+
+          echo "::group::Assertions"
+          set -x
+          # 1. health reports the exact commit we just built
+          curl -fsS http://localhost:8080/api/health | jq -e '.version == "${{ github.sha }}"'
+          # 2. the frontend is served
+          curl -fsS http://localhost:8080/ | grep -q "Student Registration"
+          # 3. routing works (no DB in CI, so the API must answer 503, not crash)
+          test "$(curl -s -o /dev/null -w '%{http_code}' -X POST http://localhost:8080/api/students -d '{}')" = "503"
+          # 4. source code is not reachable over HTTP
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8080/src/App.php)" = "404"
+          echo "::endgroup::"
+
+      - name: Show container logs on failure
+        if: failure()
+        run: docker logs smoke
+
+      - name: Log in to GitHub Container Registry
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Push image
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          docker push ${{ steps.meta.outputs.image }}
+          docker push ${{ steps.meta.outputs.repo }}:latest
+          echo "### 🐳 Published \`${{ steps.meta.outputs.image }}\`" >> "$GITHUB_STEP_SUMMARY"
+
+  # ==========================================================================
+  # CD STAGE: deploy the exact image we tested, then verify production
+  # ==========================================================================
+  deploy:
+    name: Deploy to Render
+    runs-on: ubuntu-latest
+    needs: docker
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    environment:
+      name: production          # shows up under the repo's "Environments"
+      url: ${{ vars.RENDER_APP_URL }}
+    steps:
+      - name: Check deploy configuration
+        id: config
+        env:
+          HOOK: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
+          APP_URL: ${{ vars.RENDER_APP_URL }}
+        run: |
+          if [ -z "$HOOK" ] || [ -z "$APP_URL" ]; then
+            echo "::warning::Render is not configured yet (secret RENDER_DEPLOY_HOOK_URL / variable RENDER_APP_URL). Skipping deploy - see docs/05-deploy-to-render.md"
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Trigger Render deploy of this exact image
+        if: steps.config.outputs.ready == 'true'
+        env:
+          HOOK: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
+          IMAGE: ${{ needs.docker.outputs.image }}
+        run: |
+          image_param=$(jq -rn --arg v "$IMAGE" '$v|@uri')
+          curl -fsS -X POST "${HOOK}&imgURL=${image_param}" -o /dev/null
+          echo "Deploy of $IMAGE requested."
+
+      - name: Verify production is running this commit
+        if: steps.config.outputs.ready == 'true'
+        env:
+          APP_URL: ${{ vars.RENDER_APP_URL }}
+        run: |
+          # Render free tier can take a few minutes (cold start + image pull).
+          for i in $(seq 1 40); do
+            version=$(curl -fsS "$APP_URL/api/health" | jq -r '.version' || true)
+            echo "Attempt $i: production version = ${version:-unreachable}"
+            if [ "$version" = "${{ github.sha }}" ]; then
+              echo "### ✅ Production is running \`${GITHUB_SHA::7}\` at $APP_URL" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            sleep 15
+          done
+          echo "::error::Production did not report version ${{ github.sha }} within 10 minutes"
+          exit 1

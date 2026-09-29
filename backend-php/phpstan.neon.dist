@@ -1,0 +1,8 @@
+# Static analysis finds bugs WITHOUT running the code (wrong types,
+# undefined methods, impossible conditions...). Level 0 = relaxed, 10 = strictest.
+parameters:
+    level: 8
+    paths:
+        - src
+        - public
+        - tests

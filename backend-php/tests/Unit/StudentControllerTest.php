@@ -23,6 +23,7 @@ final class StudentControllerTest extends TestCase
     public function testRegistersValidStudent(): void
     {
                 $response = $this->controller->register($this->validInput());
+                // access the response body and status code should be 201
         self::assertSame(201, $response->status);
                     self::assertSame(
                         'Asha Verma',
